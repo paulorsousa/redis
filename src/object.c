@@ -93,6 +93,7 @@ robj *createObject(int type, void *ptr) {
     o->lru = 0;
     o->iskvobj = 0;
     o->expirable = 0;
+    o->len = -1;
     return o;
 }
 
@@ -853,7 +854,11 @@ robj *tryObjectEncodingEx(robj *o, int try_trim) {
     /* Check if we can represent this string as a long integer.
      * Note that we are sure that a string larger than 20 chars is not
      * representable as a 32 nor 64 bit integer. */
-    len = sdslen(s);
+    if(o->len == -1)
+        o->len = sdslen(s);
+    
+    len = o->len;
+
     if (len <= 20 && string2l(s,len,&value)) {
         /* This object is encodable as a long. */
         if (o->encoding == OBJ_ENCODING_RAW) {
@@ -1001,7 +1006,11 @@ int equalStringObjects(robj *a, robj *b) {
 size_t stringObjectLen(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
     if (sdsEncodedObject(o)) {
-        return sdslen(o->ptr);
+        if(o->len == -1)
+            o->len = sdslen(o->ptr);
+        
+
+        return o->len;
     } else {
         return sdigits10((long)o->ptr);
     }

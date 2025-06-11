@@ -1045,6 +1045,7 @@ struct redisObject {
                              * If set, then this object is of type kvobj */
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *ptr;
+    int len;
 };
 
 /* The string name for an object's type as listed above
