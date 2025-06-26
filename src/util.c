@@ -681,32 +681,30 @@ static int string2llScalar(const char *s, size_t slen, long long *value) {
     return 1;
 }
 
-#if HAVE_IFUNC && defined (HAVE_X86_SIMD)
-// TODO: remove "unused" attribute when clang >= 19 (fixes ifunc resolver demangling)
-__attribute__((no_sanitize_address, unused)) static int (*string2ll_resolver(void))(const char *, size_t, long long *) {
-    /* Ifunc resolvers run before ASan initialization and before CPU detection
-     * is initialized, so disable ASan and init CPU detection here. */
+/* Function pointer for string2ll implementation */
+static int (*string2ll_impl)(const char *, size_t, long long *) = NULL;
+
+/* Initialize the string2ll function pointer based on CPU capabilities */
+void initString2ll(void) {
+#ifdef HAVE_X86_SIMD
+    /* Initialize CPU detection if not already done */
     __builtin_cpu_init();
+
     if (__builtin_cpu_supports("avx512f") &&
         __builtin_cpu_supports("avx512vl") &&
-        __builtin_cpu_supports("avx512bw"))
-        return string2llAVX512;
-    return string2llScalar;
+        __builtin_cpu_supports("avx512bw")) {
+        string2ll_impl = string2llAVX512;
+    } else {
+        string2ll_impl = string2llScalar;
+    }
+#else
+    string2ll_impl = string2llScalar;
+#endif
 }
 
-int string2ll(const char *s, size_t slen, long long *value)
-    __attribute__((ifunc("string2ll_resolver")));
-#else
 int string2ll(const char *s, size_t slen, long long *value) {
-#ifdef HAVE_X86_SIMD
-    if (__builtin_cpu_supports("avx512f") &&
-        __builtin_cpu_supports("avx512vl") &&
-        __builtin_cpu_supports("avx512bw"))
-        return string2llAVX512(s, slen, value);
-#endif
-    return string2llScalar(s, slen, value);
+    return string2ll_impl(s, slen, value);
 }
-#endif /* HAVE_IFUNC && defined (HAVE_X86_SIMD) */
 
 /* Helper function to convert a string to an unsigned long long value.
  * The function attempts to use the faster string2ll() function inside

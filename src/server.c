@@ -2831,6 +2831,7 @@ void initServer(void) {
     }
 
     createSharedObjects();
+    initString2ll();
     adjustOpenFilesLimit();
     const char *clk_msg = monotonicInit();
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
