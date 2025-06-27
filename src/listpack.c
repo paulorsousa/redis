@@ -1655,7 +1655,7 @@ unsigned int lpCompare(unsigned char *p, unsigned char *s, uint32_t slen,
         if (cached_valid != NULL) {
             /* Use caching */
             if (*cached_valid == 0) {
-                if (string2ll((const char*)s, slen, (int64_t*)cached_longval)) {
+                if (string2ll((const char*)s, slen, (long long*)cached_longval)) {
                     *cached_valid = 1;
                 } else {
                     *cached_valid = -1;
