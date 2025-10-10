@@ -1204,6 +1204,7 @@ void hllMergeDense(uint8_t* reg_raw, const uint8_t* reg_dense) {
 #endif
 
     uint8_t val;
+    #pragma GCC unroll 4
     for (int i = 0; i < HLL_REGISTERS; i++) {
         HLL_DENSE_GET_REGISTER(val, reg_dense, i);
         if (val > reg_raw[i]) {
