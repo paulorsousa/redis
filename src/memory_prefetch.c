@@ -29,6 +29,20 @@ typedef enum {
     PREFETCH_DONE        /* Indicates that prefetching for this key is complete */
 } PrefetchState;
 
+typedef enum {
+    HASHTABLE_PREFETCH_ENTRY, /* Initial state, prefetch entries associated with the given key's hash */
+    HASHTABLE_PREFETCH_INIT,  /* Initial state, prefetch entries associated with the given key's hash */
+    HASHTABLE_PREFETCH_VALUE, /* prefetch the value object of the entry found in the previous step */
+} HashtablePrefetchState;
+
+typedef struct {
+    HashtablePrefetchState state; /* Current state of the prefetch operation */
+    HashTableIndex ht_idx;        /* Index of the current hash table (0 or 1 for rehashing) */
+    uint64_t bucket_idx;          /* Index of the bucket in the current hash table */
+    uint64_t key_hash;            /* Hash value of the key being prefetched */
+    dictEntry *current_entry;     /* Pointer to the current entry being processed */
+} ValuePrefetchInfo;
+
 
 /************************************ State machine diagram for the prefetch operation. ********************************
                                                            │
@@ -66,6 +80,8 @@ typedef struct KeyPrefetchInfo {
     uint64_t key_hash;        /* Hash value of the key being prefetched */
     dictEntry *current_entry; /* Pointer to the current entry being processed */
     kvobj *current_kv;        /* Pointer to the kv object being prefetched */
+    client *client;           /* Pointer to the client for this key */
+    ValuePrefetchInfo value_prefetch_info; /* State for nested hash table prefetching */
 } KeyPrefetchInfo;
 
 /* PrefetchCommandsBatch structure holds the state of the current batch of client commands being processed. */
@@ -76,6 +92,7 @@ typedef struct PrefetchCommandsBatch {
     size_t max_prefetch_size;       /* Maximum number of keys to prefetch in a batch */
     void **keys;                    /* Array of keys to prefetch in the current batch */
     client **clients;               /* Array of clients in the current batch */
+    client **key_clients;           /* Array mapping each key to its client */
     dict **keys_dicts;              /* Main dict for each key */
     dict **current_dicts;           /* Points to dict to prefetch from */
     KeyPrefetchInfo *prefetch_info; /* Prefetch info for each key */
@@ -91,6 +108,7 @@ void freePrefetchCommandsBatch(void) {
 
     zfree(batch->clients);
     zfree(batch->keys);
+    zfree(batch->key_clients);
     zfree(batch->keys_dicts);
     zfree(batch->prefetch_info);
     zfree(batch);
@@ -113,6 +131,7 @@ void prefetchCommandsBatchInit(void) {
     batch->max_prefetch_size = max_prefetch_size;
     batch->clients = zcalloc(max_prefetch_size * sizeof(client *));
     batch->keys = zcalloc(max_prefetch_size * sizeof(void *));
+    batch->key_clients = zcalloc(max_prefetch_size * sizeof(client *));
     batch->keys_dicts = zcalloc(max_prefetch_size * sizeof(dict *));
     batch->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
 }
@@ -164,6 +183,8 @@ static void initBatchInfo(dict **dicts, GetValueDataFunc func) {
         info->ht_idx = HT_IDX_INVALID;
         info->current_entry = NULL;
         info->current_kv = NULL;
+        info->client = batch->key_clients[i];
+        info->value_prefetch_info.state = HASHTABLE_PREFETCH_ENTRY;
         info->state = PREFETCH_BUCKET;
         info->key_hash = dictGetHash(batch->current_dicts[i], batch->keys[i]);
     }
@@ -226,6 +247,77 @@ static inline void prefetchKVOject(KeyPrefetchInfo *info) {
     if (!is_kv) prefetchAndMoveToNextKey(kv);
 }
 
+/* Prefetch hash object's internal dictionary for HGET/HSET commands.
+ * Returns true if more prefetching is needed, false if done. */
+static bool prefetchHashObj(KeyPrefetchInfo *info, kvobj *val) {
+    if (info->client) {
+        pendingCommand *pcmd = info->client->pending_cmds.head;
+        if (pcmd && pcmd->cmd && (pcmd->cmd->proc == hsetCommand || pcmd->cmd->proc == hgetCommand)) {
+            serverLog(LL_DEBUG, "prefetchHashObj: Prefetching hash object for %s command",
+                      pcmd->cmd->proc == hsetCommand ? "HSET" : "HGET");
+
+            dict *hash_dict = val->ptr;
+
+            if (info->value_prefetch_info.state == HASHTABLE_PREFETCH_ENTRY) {
+                /* Prefetch the hash dict structure itself */
+                redis_prefetch_read(hash_dict);
+                info->value_prefetch_info.state = HASHTABLE_PREFETCH_INIT;
+                return true;
+            }
+
+            if (info->value_prefetch_info.state == HASHTABLE_PREFETCH_INIT) {
+                /* Initialize prefetching for the field lookup in the hash */
+                /* The field is in argv[2] for both HGET and HSET */
+                sds field = info->client->argv[2]->ptr;
+                info->value_prefetch_info.key_hash = dictGetHash(hash_dict, field);
+                info->value_prefetch_info.ht_idx = HT_IDX_INVALID;
+                info->value_prefetch_info.current_entry = NULL;
+                info->value_prefetch_info.state = HASHTABLE_PREFETCH_VALUE;
+                return true;
+            }
+
+            if (info->value_prefetch_info.state == HASHTABLE_PREFETCH_VALUE) {
+                /* Prefetch bucket and entry in the hash's internal dict */
+
+                /* Determine which hash table to use */
+                if (info->value_prefetch_info.ht_idx == HT_IDX_INVALID) {
+                    info->value_prefetch_info.ht_idx = HT_IDX_FIRST;
+                } else if (info->value_prefetch_info.ht_idx == HT_IDX_FIRST &&
+                           dictIsRehashing(hash_dict)) {
+                    info->value_prefetch_info.ht_idx = HT_IDX_SECOND;
+                } else {
+                    /* Done with all hash tables */
+                    info->state = PREFETCH_DONE;
+                    return false;
+                }
+
+                /* Prefetch the bucket */
+                info->value_prefetch_info.bucket_idx =
+                    info->value_prefetch_info.key_hash &
+                    DICTHT_SIZE_MASK(hash_dict->ht_size_exp[info->value_prefetch_info.ht_idx]);
+                prefetchAndMoveToNextKey(
+                    &hash_dict->ht_table[info->value_prefetch_info.ht_idx]
+                                        [info->value_prefetch_info.bucket_idx]);
+
+                /* Get the first entry in the bucket */
+                info->value_prefetch_info.current_entry =
+                    hash_dict->ht_table[info->value_prefetch_info.ht_idx]
+                                       [info->value_prefetch_info.bucket_idx];
+
+                if (info->value_prefetch_info.current_entry) {
+                    /* Prefetch the entry */
+                    prefetchAndMoveToNextKey(info->value_prefetch_info.current_entry);
+                }
+
+                return true;
+            }
+        }
+    }
+
+    info->state = PREFETCH_DONE;
+    return false;
+}
+
 /* Prefetch the value data of the kv object found in dict entry. */
 static void prefetchValueData(KeyPrefetchInfo *info) {
     size_t i = batch->cur_idx;
@@ -237,7 +329,10 @@ static void prefetchValueData(KeyPrefetchInfo *info) {
     if ((!dictGetNext(info->current_entry) && !dictIsRehashing(batch->current_dicts[i])) ||
         dictCompareKeys(batch->current_dicts[i], batch->keys[i], key))
     {
-        if (batch->get_value_data_func) {
+        /* Check if the value is a hash with hashtable encoding */
+        if (kv->encoding == OBJ_ENCODING_HT && kv->type == OBJ_HASH) {
+            if (prefetchHashObj(info, kv)) return;
+        } else if (batch->get_value_data_func) {
             void *value_data = batch->get_value_data_func(kv);
             if (value_data) prefetchAndMoveToNextKey(value_data);
         }
@@ -359,8 +454,11 @@ void prefetchCommands(void) {
 
     /* Prefetch dict keys for all commands.
      * Prefetching is beneficial only if there are more than one key. */
+    serverLog(LL_DEBUG, "prefetchCommands: batch->key_count=%zu, batch->client_count=%zu",
+              batch->key_count, batch->client_count);
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
+        serverLog(LL_DEBUG, "prefetchCommands: Starting dictPrefetch with %zu keys", batch->key_count);
         /* Prefetch keys from the main dict */
         dictPrefetch(batch->keys_dicts, getObjectValuePtr);
     }
@@ -402,6 +500,7 @@ int addCommandToBatch(client *c) {
         serverAssert(pcmd->flags & PENDING_CMD_KEYS_RESULT_VALID);
         for (int i = 0; i < pcmd->keys_result.numkeys && batch->key_count < batch->max_prefetch_size; i++) {
             batch->keys[batch->key_count] = pcmd->argv[pcmd->keys_result.keys[i].pos];
+            batch->key_clients[batch->key_count] = c;
             batch->keys_dicts[batch->key_count] =
                 kvstoreGetDict(c->db->keys, pcmd->slot > 0 ? pcmd->slot : 0);
             batch->key_count++;
