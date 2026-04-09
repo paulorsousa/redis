@@ -732,6 +732,7 @@ typedef struct {
 /* Check if two listpack nodes have identical master entries (field names and
  * order), making them safe to merge without field reconciliation.
  * Returns 1 if masters match, 0 otherwise. */
+__attribute__((cold, noinline))
 static int streamListpackMasterMatch(unsigned char *lp1, unsigned char *lp2) {
     unsigned char *p1 = lpFirst(lp1);
     unsigned char *p2 = lpFirst(lp2);
@@ -784,6 +785,7 @@ static int streamListpackMasterMatch(unsigned char *lp1, unsigned char *lp2) {
  * This function works by iterating over 'lp2' and appending each entry to 'lp1',
  * recalculating the ID deltas and lp-count fields as it goes. Finally, it
  * updates the stream-specific header (entry count, deleted count) in 'lp1'. */
+__attribute__((cold, noinline))
 static unsigned char *streamListpackMerge(unsigned char *lp1, unsigned char *lp2, streamID *id1, streamID *id2) {
     /* 1. Get counts from both nodes. */
     unsigned char *p1_header = lpFirst(lp1);
@@ -928,6 +930,7 @@ static unsigned char *streamListpackMerge(unsigned char *lp1, unsigned char *lp2
  *
  * The caller is responsible for freeing the old listpack 'lp' ONLY
  * if the returned pointer is different from 'lp'. */
+__attribute__((cold, noinline))
 static unsigned char *streamListpackCompaction(stream *s, raxIterator *ri, unsigned char *lp, int64_t entries, int64_t marked_deleted, int allow_merge) {
     /* We only compact if there are deleted entries, and the ratio
      * of deleted entries is high enough. */
