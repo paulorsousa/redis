@@ -22,7 +22,6 @@ typedef struct stream {
     uint64_t entries_added; /* All time count of elements added. */
     size_t alloc_size;      /* Total allocated memory (in bytes) by this stream. */
     rax *cgroups;           /* Consumer groups dictionary: name -> streamCG */
-    rax *cgroups_ref;       /* Index mapping message IDs to their consumer groups. */
     streamID min_cgroup_last_id;  /* The minimum ID of consume group. */
     unsigned int min_cgroup_last_id_valid: 1;
 } stream;
@@ -113,7 +112,6 @@ typedef struct streamNACK {
     uint64_t delivery_count;    /* Number of times this message was delivered.*/
     streamConsumer *consumer;   /* The consumer this message was delivered to
                                    in the last delivery. */
-    listNode *cgroup_ref_node; /* Reference to this NACK in the cgroups_ref list. */
 } streamNACK;
 
 /* Stream propagation information, passed to functions in order to propagate

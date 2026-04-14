@@ -67,7 +67,6 @@ stream *streamNew(void) {
     s->max_deleted_entry_id.ms = 0;
     s->entries_added = 0;
     s->cgroups = NULL; /* Created on demand to save memory when not used. */
-    s->cgroups_ref = NULL;
     s->min_cgroup_last_id.ms = UINT64_MAX;
     s->min_cgroup_last_id.seq = UINT64_MAX;
     s->min_cgroup_last_id_valid = 0;
@@ -85,8 +84,6 @@ void freeStream(stream *s) {
     raxFreeWithCbAndContext(s->rax, streamLpFreeGeneric, s);
     if (s->cgroups)
         raxFreeWithCbAndContext(s->cgroups, streamFreeCGGeneric, s);
-    if (s->cgroups_ref)
-        raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
     debugServerAssert(s->alloc_size == zmalloc_usable_size(s));
     zfree(s);
 }
@@ -222,7 +219,6 @@ robj *streamDup(robj *o) {
             streamNACK *new_nack = streamCreateNACK(new_s, NULL);
             new_nack->delivery_time = nack->delivery_time;
             new_nack->delivery_count = nack->delivery_count;
-            new_nack->cgroup_ref_node = streamLinkCGroupToEntry(new_s, new_cg, ri_cg_pel.key);
             raxInsert(new_cg->pel, ri_cg_pel.key, sizeof(streamID), new_nack, NULL);
 
             streamID id;
@@ -2543,8 +2539,6 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                 nack->delivery_count = 1;
                 /* Add the entry in the new consumer local PEL. */
                 raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
-            } else if (group_inserted == 1 && consumer_inserted == 1) {
-                nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
             } else if (group_inserted == 1 && consumer_inserted == 0) {
                 serverPanic("NACK half-created. Should not be possible.");
             }
@@ -3362,74 +3356,31 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id) {
     cg->last_id = *id;
 }
 
-/* Link a consumer group to a stream entry in the cgroups_ref index.
- * Returns a pointer to the list node, so that it can be used for future deletion. */
-listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
-    list *cglist;
-
-    if (!s->cgroups_ref)
-        s->cgroups_ref = raxNewWithMetadata(0, &s->alloc_size);
-    
-    /* Try to find the list for this stream ID, create it if it doesn't exist */
-    if (!raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
-        cglist = listCreate();
-        serverAssert(raxInsert(s->cgroups_ref, key, sizeof(streamID), cglist, NULL));
-    }
-    
-    /* Add the consumer group to the list and return the list node */
-    listAddNodeTail(cglist, cg);
-    return listLast(cglist);
-}
-
-/* Unlink a consumer group reference from the entry index for a specific stream ID.
- * This is called when a message is acknowledged or when a consumer group is deleted. */
-void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *key) {
-    list *cglist;
-    if (!s->cgroups_ref) return;
-    if (raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
-        listDelNode(cglist, na->cgroup_ref_node);
-        
-        /* If the list is now empty, remove it from the index. */
-        if (listLength(cglist) == 0) {
-            raxRemove(s->cgroups_ref, key, sizeof(streamID), NULL);
-            listRelease(cglist);
-        }
-    }
-}
-
-/* Remove all consumer group references to a specific stream message. */
+/* Remove all consumer group references to a specific stream message.
+ * Called during XDEL with DELETE_STRATEGY_DELREF: removes the pending
+ * entry from every consumer group's PEL so the entry can be freed.
+ * This path is only taken when entries are explicitly deleted, not during
+ * normal XREADGROUP delivery. */
 void streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
-    if (!s->cgroups_ref) return;
-    list *cglist;
-    listIter li;
-    listNode *ln;
+    if (!s->cgroups) return;
     unsigned char buf[sizeof(streamID)];
     streamEncodeID(buf, id);
 
-    /* If message is not in any consumer group, nothing to do */
-    if (!raxFind(s->cgroups_ref, buf, sizeof(streamID), (void **)&cglist))
-        return;
-
-    listRewind(cglist, &li);
-    while ((ln = listNext(&li))) {
+    raxIterator it;
+    raxStart(&it, s->cgroups);
+    raxSeek(&it, "^", NULL, 0);
+    while (raxNext(&it)) {
+        streamCG *group = it.data;
         streamNACK *nack;
-        streamCG *group = listNodeValue(ln);
-        
-        /* Find the message in this consumer group's PEL */
-        serverAssert(raxFind(group->pel, buf, sizeof(buf), (void **)&nack));
-        
-        /* Remove from group and consumer PELs */
-        raxRemove(group->pel, buf, sizeof(buf), NULL);
+        if (!raxFind(group->pel, buf, sizeof(buf), (void **)&nack)) continue;
+
         if (group->pel_by_time_valid)
             raxRemovePelByTime(group->pel_by_time, nack->delivery_time, id);
         raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
-        /* Since we're removing all references from the cgroups_ref, we can directly
-         * free the NACK without unlinking it from the cgroups_ref. */
+        raxRemove(group->pel, buf, sizeof(buf), NULL);
         streamFreeNACK(s, nack);
     }
-
-    raxRemove(s->cgroups_ref, buf, sizeof(streamID), NULL);
-    listRelease(cglist);
+    raxStop(&it);
 }
 
 /* Check if a stream entry is still referenced by any consumer group.
@@ -3463,11 +3414,22 @@ int streamEntryIsReferenced(stream *s, streamID *id) {
     if (streamCompareID(&s->min_cgroup_last_id, id) < 0)
         return 1;
 
-    /* Check if the message is in any consumer group's PEL */
-    if (!s->cgroups_ref) return 0;
+    /* Check if the message is in any consumer group's PEL by scanning all groups. */
     unsigned char buf[sizeof(streamID)];
     streamEncodeID(buf, id);
-    return raxFind(s->cgroups_ref, buf, sizeof(streamID), NULL);
+    raxIterator it;
+    raxStart(&it, s->cgroups);
+    raxSeek(&it, "^", NULL, 0);
+    int referenced = 0;
+    while (raxNext(&it)) {
+        streamCG *group = it.data;
+        if (raxFind(group->pel, buf, sizeof(buf), NULL)) {
+            referenced = 1;
+            break;
+        }
+    }
+    raxStop(&it);
+    return referenced;
 }
 
 /* Create a NACK entry setting the delivery count to 1 and the delivery
@@ -3480,7 +3442,6 @@ streamNACK *streamCreateNACK(stream *s, streamConsumer *consumer) {
     nack->delivery_time = commandTimeSnapshot();
     nack->delivery_count = 1;
     nack->consumer = consumer;
-    nack->cgroup_ref_node = NULL;  /* Will be set when added to cgroups_ref */
     return nack;
 }
 
@@ -3491,11 +3452,10 @@ void streamFreeNACK(stream *s, streamNACK *na) {
     s->alloc_size -= usable;
 }
 
-/* Free a NACK entry and remove its reference from the cgroups_ref.
- * This ensures proper cleanup of the consumer group list associated with the message ID. */
+/* Free a NACK entry and clean up associated data structures. */
 void streamDestroyNACK(stream *s, streamNACK *na, unsigned char *key) {
+    UNUSED(key);
     size_t usable;
-    streamUnlinkEntryFromCGroupRef(s, na, key);
     zfree_usable(na, &usable);
     s->alloc_size -= usable;
 }
@@ -3562,16 +3522,6 @@ static void streamFreeCG(stream *s, streamCG *cg) {
 
 /* Destroy a consumer group and clean up all associated references. */
 void streamDestroyCG(stream *s, streamCG *cg) {
-    /* Remove all references from the cgroups_ref. */
-    raxIterator it;
-    raxStart(&it, cg->pel);
-    raxSeek(&it, "^", NULL, 0);
-    while (raxNext(&it)) {
-        streamNACK *nack = it.data;
-        streamUnlinkEntryFromCGroupRef(s, nack, it.key);
-    }
-    raxStop(&it);
-
     /* If we're destroying the group with the minimum last_id, the cached
      * minimum is no longer valid and needs to be recalculated from the
      * remaining groups. */
@@ -3639,8 +3589,6 @@ void streamDelConsumer(stream *s, streamCG *cg, streamConsumer *consumer) {
     raxSeek(&ri,"^",NULL,0);
     while(raxNext(&ri)) {
         streamNACK *nack = ri.data;
-        streamUnlinkEntryFromCGroupRef(s, nack, ri.key);
-
         streamID id;
         streamDecodeID(ri.key, &id);
 
@@ -4519,7 +4467,6 @@ void xclaimCommand(client *c) {
             raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
             if (group->pel_by_time_valid)
                 raxInsertPelByTime(group->pel_by_time, nack->delivery_time, &id);
-            nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
         }
 
         if (nack != NULL) {
