@@ -82,6 +82,10 @@ typedef struct streamCG {
                                by time. The key is a pelTimeKey structure containing
                                both delivery_time and stream ID. All information is
                                in the key; no value is stored. */
+    int pel_by_time_valid;  /* 1 if pel_by_time is a complete, accurate index of
+                               pel. 0 (stale) if modifications were made without
+                               maintaining pel_by_time. Rebuilt lazily on demand
+                               by XAUTOCLAIM / XREADGROUP with min-idle-time. */
     rax *consumers;         /* A radix tree representing the consumers by name
                                and their associated representation in the form
                                of streamConsumer structures. */
