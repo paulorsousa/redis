@@ -883,7 +883,6 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
     PendingEntryContext *ctx = privdata;
     streamNACK *nack = ri->data, *newnack;
     nack->consumer = ctx->c; /* update nack pointer to consumer */
-    nack->cgroup_ref_node->value = ctx->cg; /* Update the value of cgroups_ref node to the consumer group. */
     newnack = activeDefragAlloc(nack);
     if (newnack) {
         /* Update consumer group pointer to the nack.
@@ -969,10 +968,6 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
         defragRadixTree(&s->cgroups, 0, defragStreamConsumerGroup, s);
     }
 
-    if (s->cgroups_ref) {
-        /* Update cgroups_ref back-pointer to new stream */
-        s->cgroups_ref->alloc_size = &s->alloc_size;
-    }
 }
 
 /* Defrag a module key. This is either done immediately or scheduled
