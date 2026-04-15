@@ -42,7 +42,6 @@ typedef struct stream {
     uint64_t entries_added; /* All time count of elements added. */
     size_t alloc_size;      /* Total allocated memory (in bytes) by this stream. */
     rax *cgroups;           /* Consumer groups dictionary: name -> streamCG */
-    rax *cgroups_ref;       /* Index mapping message IDs to their consumer groups. */
     streamID min_cgroup_last_id;  /* The minimum ID of consume group. */
     unsigned int min_cgroup_last_id_valid: 1;
     uint64_t idmp_duration; /* IDMP duration in seconds. */
@@ -142,7 +141,6 @@ struct streamNACK {
     uint64_t delivery_count;    /* Number of times this message was delivered.*/
     streamConsumer *consumer;   /* The consumer this message was delivered to
                                    in the last delivery. */
-    listNode *cgroup_ref_node; /* Reference to this NACK in the cgroups_ref list. */
     streamID id;                /* Stream ID for this pending entry. */
     struct streamNACK *pel_prev; /* Previous NACK in time-ordered doubly-linked list. */
     struct streamNACK *pel_next; /* Next NACK in time-ordered doubly-linked list. */
@@ -200,8 +198,6 @@ int64_t streamTrimByID(stream *s, streamID minid, int approx);
 int streamEntryExists(stream *s, streamID *id);
 void streamKeyLoaded(redisDb *db, robj *key, robj *val);
 void streamKeyRemoved(redisDb *db, robj *key, robj *val);
-
-listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key);
 
 /* PEL time list management (used by RDB loading) */
 void pelListInsertSorted(streamCG *cg, streamNACK *nack);

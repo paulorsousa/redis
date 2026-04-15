@@ -859,8 +859,6 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
     streamConsumer *c = privdata;
     streamNACK *nack = ri->data;
     /* NACKs are already defragged by the CG PEL walk (defragStreamCGPendingEntry).
-     * cgroup_ref_node->value is also updated there for all NACKs (including
-     * unowned NACK-zone entries that have no consumer PEL walk).
      * Here we only fix up the back-pointer to the possibly-relocated consumer. */
     nack->consumer = c;
     return NULL;
@@ -869,11 +867,6 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
 void* defragStreamCGPendingEntry(raxIterator *ri, void *privdata) {
     streamCG *cg = privdata;
     streamNACK *nack = ri->data, *newnack;
-    /* Update cgroup_ref_node to the possibly-relocated CG for every NACK.
-     * Consumer-owned entries will get this overwritten again redundantly by
-     * defragStreamConsumerPendingEntry; unowned (NACK zone) entries have no
-     * consumer PEL walk, so this is their only chance. */
-    nack->cgroup_ref_node->value = cg;
     newnack = activeDefragAlloc(nack);
     if (newnack) {
         /* If this NACK is owned by a consumer, update the consumer's PEL. */
@@ -999,11 +992,6 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
         /* Update cgroups back-pointer to new stream */
         s->cgroups->alloc_size = &s->alloc_size;
         defragRadixTree(&s->cgroups, 0, defragStreamConsumerGroup, s);
-    }
-
-    if (s->cgroups_ref) {
-        /* Update cgroups_ref back-pointer to new stream */
-        s->cgroups_ref->alloc_size = &s->alloc_size;
     }
 
     if (s->idmp_producers) {
